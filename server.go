@@ -35,6 +35,7 @@ type Server struct {
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	systemRoot    string
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -118,6 +119,14 @@ func ReadOnly() ServerOption {
 	}
 }
 
+// RootDirectory configures the root directory of a Server. Files will not be served outside this directory.
+func RootDirectory(root string) ServerOption {
+	return func(s *Server) error {
+		s.systemRoot = root
+		return nil
+	}
+}
+
 type rxPacket struct {
 	pktType  fxp
 	pktBytes []byte
@@ -145,7 +154,6 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 				orderid:        pkt.orderID()})
 			continue
 		}
-
 		if err := handlePacket(svr, pkt); err != nil {
 			return err
 		}
@@ -162,8 +170,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 			Extensions: sftpExtensions,
 		}
 	case *sshFxpStatPacket:
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
 		// stat the requested file
-		info, err := os.Stat(p.Path)
+		info, err := os.Stat(f)
 		rpkt = sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -172,8 +181,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 			rpkt = statusFromError(p, err)
 		}
 	case *sshFxpLstatPacket:
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
 		// stat the requested file
-		info, err := os.Lstat(p.Path)
+		info, err := os.Lstat(f)
 		rpkt = sshFxpStatResponse{
 			ID:   p.ID,
 			info: info,
@@ -196,25 +206,36 @@ func handlePacket(s *Server, p orderedRequest) error {
 			rpkt = statusFromError(p, err)
 		}
 	case *sshFxpMkdirPacket:
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
+
 		// TODO FIXME: ignore flags field
-		err := os.Mkdir(p.Path, 0755)
+		err := os.Mkdir(f, 0755)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(p.Path)
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
+		err := os.Remove(f)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRemovePacket:
-		err := os.Remove(p.Filename)
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Filename))
+		err := os.Remove(f)
 		rpkt = statusFromError(p, err)
 	case *sshFxpRenamePacket:
-		err := os.Rename(p.Oldpath, p.Newpath)
+		old_path := filepath.Join(s.systemRoot, filepath.Join("/", p.Oldpath))
+		new_path := filepath.Join(s.systemRoot, filepath.Join("/", p.Newpath))
+
+		err := os.Rename(old_path, new_path)
 		rpkt = statusFromError(p, err)
 	case *sshFxpSymlinkPacket:
-		err := os.Symlink(p.Targetpath, p.Linkpath)
+		target_path := filepath.Join(s.systemRoot, filepath.Join("/", p.Targetpath))
+		new_path := filepath.Join(s.systemRoot, filepath.Join("/", p.Linkpath))
+
+		err := os.Symlink(target_path, new_path)
 		rpkt = statusFromError(p, err)
 	case *sshFxpClosePacket:
 		rpkt = statusFromError(p, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
-		f, err := os.Readlink(p.Path)
+		path := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
+		f, err := os.Readlink(path)
 		rpkt = sshFxpNamePacket{
 			ID: p.ID,
 			NameAttrs: []sshFxpNameAttr{{
@@ -241,7 +262,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 			rpkt = statusFromError(p, err)
 		}
 	case *sshFxpOpendirPacket:
-		if stat, err := os.Stat(p.Path); err != nil {
+		f := filepath.Join(s.systemRoot, filepath.Join("/", p.Path))
+		// f = cleanPath(f)
+		if stat, err := os.Stat(f); err != nil {
 			rpkt = statusFromError(p, err)
 		} else if !stat.IsDir() {
 			rpkt = statusFromError(p, &os.PathError{
@@ -291,7 +314,6 @@ func handlePacket(s *Server, p orderedRequest) error {
 	default:
 		return errors.Errorf("unexpected packet type %T", p)
 	}
-
 	s.pktMgr.readyPacket(s.pktMgr.newOrderedResponse(rpkt, p.orderID()))
 	return nil
 }
@@ -411,7 +433,8 @@ func (p sshFxpOpenPacket) respond(svr *Server) responsePacket {
 		osFlags |= os.O_EXCL
 	}
 
-	f, err := os.OpenFile(p.Path, osFlags, 0644)
+	realfilename := filepath.Join(svr.systemRoot, filepath.Join("/", p.Path))
+	f, err := os.OpenFile(realfilename, osFlags, 0644)
 	if err != nil {
 		return statusFromError(p, err)
 	}
